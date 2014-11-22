@@ -1,0 +1,1207 @@
+diff --git a/configure b/configure
+index a9e4d49..d63b8a1 100755
+--- a/configure
++++ b/configure
+@@ -2942,6 +2942,16 @@ else
+ fi
+ 
+ ##########################################
++# TPM xenstubdoms is only on x86 Linux
++
++if test "$targetos" = Linux && test "$cpu" = i386 -o "$cpu" = x86_64 && \
++   test "$xen" = "yes"; then
++  tpm_xenstubdoms=$tpm
++else
++  tpm_xenstubdoms=no
++fi
++
++##########################################
+ # attr probe
+ 
+ if test "$attr" != "no" ; then
+@@ -4333,6 +4343,7 @@ echo "gcov              $gcov_tool"
+ echo "gcov enabled      $gcov"
+ echo "TPM support       $tpm"
+ echo "libssh2 support   $libssh2"
++echo "TPM xenstubdoms   $tpm_xenstubdoms"
+ echo "TPM passthrough   $tpm_passthrough"
+ echo "QOM debugging     $qom_cast_debug"
+ echo "vhdx              $vhdx"
+@@ -4810,6 +4821,9 @@ if test "$tpm" = "yes"; then
+   if test "$tpm_passthrough" = "yes"; then
+     echo "CONFIG_TPM_PASSTHROUGH=y" >> $config_host_mak
+   fi
++  if test "$tpm_xenstubdoms" = "yes"; then
++    echo "CONFIG_TPM_XENSTUBDOMS=y" >> $config_host_mak
++  fi
+ fi
+ 
+ echo "TRACE_BACKENDS=$trace_backends" >> $config_host_mak
+diff --git a/hmp.c b/hmp.c
+index 63d7686..5d2bcf9 100644
+--- a/hmp.c
++++ b/hmp.c
+@@ -689,6 +689,7 @@ void hmp_info_tpm(Monitor *mon, const QDict *qdict)
+     Error *err = NULL;
+     unsigned int c = 0;
+     TPMPassthroughOptions *tpo;
++    TPMXenstubdomsOptions *txo;
+ 
+     info_list = qmp_query_tpm(&err);
+     if (err) {
+@@ -718,6 +719,12 @@ void hmp_info_tpm(Monitor *mon, const QDict *qdict)
+                            tpo->has_cancel_path ? ",cancel-path=" : "",
+                            tpo->has_cancel_path ? tpo->cancel_path : "");
+             break;
++       case TPM_TYPE_OPTIONS_KIND_XENSTUBDOMS:
++            txo = ti->options->xenstubdoms;
++            if (!txo) {
++                monitor_printf(mon, "null TPMXenstubdomsOptions error!\n");
++            }
++            break;
+         case TPM_TYPE_OPTIONS_KIND_MAX:
+             break;
+         }
+diff --git a/hw/tpm/Makefile.objs b/hw/tpm/Makefile.objs
+index 99f5983..20f0a7b 100644
+--- a/hw/tpm/Makefile.objs
++++ b/hw/tpm/Makefile.objs
+@@ -1,2 +1,4 @@
+ common-obj-$(CONFIG_TPM_TIS) += tpm_tis.o
+ common-obj-$(CONFIG_TPM_PASSTHROUGH) += tpm_passthrough.o
++common-obj-$(CONFIG_TPM_XENSTUBDOMS) += tpm_xenstubdoms.o
++common-obj-$(CONFIG_TPM_XENSTUBDOMS) += xen_stubdom_vtpm.o
+diff --git a/hw/tpm/tpm_xenstubdoms.c b/hw/tpm/tpm_xenstubdoms.c
+new file mode 100644
+index 0000000..845df18
+--- /dev/null
++++ b/hw/tpm/tpm_xenstubdoms.c
+@@ -0,0 +1,238 @@
++/*
++ * Xen Stubdom vTPM driver
++ *
++ *  Copyright (c) 2014 Intel Corporation
++ *  Authors:
++ *    Quan Xu <quan.xu@intel.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, see <http://www.gnu.org/licenses/>
++ */
++
++#include <dirent.h>
++#include "qemu-common.h"
++#include "qapi/error.h"
++#include "qemu/sockets.h"
++#include "qemu/log.h"
++#include "sysemu/tpm_backend.h"
++#include "tpm_int.h"
++#include "hw/hw.h"
++#include "hw/i386/pc.h"
++#include "hw/xen/xen_backend.h"
++#include "sysemu/tpm_backend_int.h"
++#include "tpm_tis.h"
++
++#ifdef DEBUG_TPM
++#define DPRINTF(fmt, ...) \
++    do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
++#else
++#define DPRINTF(fmt, ...) \
++    do { } while (0)
++#endif
++
++#define TYPE_TPM_XENSTUBDOMS "tpm-xenstubdoms"
++#define TPM_XENSTUBDOMS(obj) \
++    OBJECT_CHECK(TPMXenstubdomsState, (obj), TYPE_TPM_XENSTUBDOMS)
++
++static const TPMDriverOps tpm_xenstubdoms_driver;
++
++/* data structures */
++typedef struct TPMXenstubdomsThreadParams {
++    TPMState *tpm_state;
++    TPMRecvDataCB *recv_data_callback;
++    TPMBackend *tb;
++} TPMXenstubdomsThreadParams;
++
++struct TPMXenstubdomsState {
++    TPMBackend parent;
++    TPMBackendThread tbt;
++    TPMXenstubdomsThreadParams tpm_thread_params;
++    bool had_startup_error;
++};
++
++typedef struct TPMXenstubdomsState TPMXenstubdomsState;
++
++/* functions */
++
++static void tpm_xenstubdoms_cancel_cmd(TPMBackend *tb);
++
++static int tpm_xenstubdoms_unix_transfer(const TPMLocality *locty_data)
++{
++    size_t rlen;
++    xen_vtpm_send(locty_data->w_buffer.buffer, locty_data->w_offset);
++    xen_vtpm_recv(locty_data->r_buffer.buffer, &rlen);
++    return 0;
++}
++
++static void tpm_xenstubdoms_worker_thread(gpointer data,
++                                          gpointer user_data)
++{
++    TPMXenstubdomsThreadParams *thr_parms = user_data;
++    TPMBackendCmd cmd = (TPMBackendCmd)data;
++
++    switch (cmd) {
++    case TPM_BACKEND_CMD_PROCESS_CMD:
++        /* here need a the cmd process function */
++        tpm_xenstubdoms_unix_transfer(thr_parms->tpm_state->locty_data);
++        thr_parms->recv_data_callback(thr_parms->tpm_state,
++                                      thr_parms->tpm_state->locty_number);
++        break;
++    case TPM_BACKEND_CMD_INIT:
++    case TPM_BACKEND_CMD_END:
++    case TPM_BACKEND_CMD_TPM_RESET:
++        /* nothing to do */
++        break;
++    }
++}
++
++/*
++ *  * Start the TPM (thread). If it had been started before, then terminate
++ *   * and start it again.
++ *    */
++static int tpm_xenstubdoms_startup_tpm(TPMBackend *tb)
++{
++    TPMXenstubdomsState *tpm_xs = TPM_XENSTUBDOMS(tb);
++
++    tpm_backend_thread_tpm_reset(&tpm_xs->tbt, tpm_xenstubdoms_worker_thread,
++                                 &tpm_xs->tpm_thread_params);
++
++    return 0;
++}
++
++static void tpm_xenstubdoms_reset(TPMBackend *tb)
++{
++    TPMXenstubdomsState *tpm_xs = TPM_XENSTUBDOMS(tb);
++
++    tpm_backend_thread_end(&tpm_xs->tbt);
++    tpm_xs->had_startup_error = false;
++}
++
++static int tpm_xenstubdoms_init(TPMBackend *tb, TPMState *s,
++                                TPMRecvDataCB *recv_data_cb)
++{
++    TPMXenstubdomsState *tpm_xs = TPM_XENSTUBDOMS(tb);
++
++    tpm_xs->tpm_thread_params.tpm_state = s;
++    tpm_xs->tpm_thread_params.recv_data_callback = recv_data_cb;
++    tpm_xs->tpm_thread_params.tb = tb;
++    return 0;
++}
++
++static bool tpm_xenstubdoms_get_tpm_established_flag(TPMBackend *tb)
++{
++    return false;
++}
++
++static bool tpm_xenstubdoms_get_startup_error(TPMBackend *tb)
++{
++    TPMXenstubdomsState *tpm_xs = TPM_XENSTUBDOMS(tb);
++
++    return tpm_xs->had_startup_error;
++}
++
++static size_t tpm_xenstubdoms_realloc_buffer(TPMSizedBuffer *sb)
++{
++    size_t wanted_size = 4096; /* Linux tpm.c buffer size */
++
++    if (sb->size != wanted_size) {
++        sb->buffer = g_realloc(sb->buffer, wanted_size);
++        sb->size = wanted_size;
++    }
++    return sb->size;
++}
++
++static void tpm_xenstubdoms_deliver_request(TPMBackend *tb)
++{
++    TPMXenstubdomsState *tpm_xs = TPM_XENSTUBDOMS(tb);
++    tpm_backend_thread_deliver_request(&tpm_xs->tbt);
++}
++
++static void tpm_xenstubdoms_cancel_cmd(TPMBackend *tb)
++{
++}
++
++static const char *tpm_xenstubdoms_create_desc(void)
++{
++    return "Xenstubdoms TPM backend driver";
++}
++
++static TPMBackend *tpm_xenstubdoms_create(QemuOpts *opts, const char *id)
++{
++    Object *obj = object_new(TYPE_TPM_XENSTUBDOMS);
++    TPMBackend *tb = TPM_BACKEND(obj);
++
++    tb->id = g_strdup(id);
++    tb->fe_model = -1;
++    tb->ops = &tpm_xenstubdoms_driver;
++    return tb;
++}
++
++static void tpm_xenstubdoms_destroy(TPMBackend *tb)
++{
++    TPMXenstubdomsState *tpm_xh = TPM_XENSTUBDOMS(tb);
++    tpm_backend_thread_end(&tpm_xh->tbt);
++
++    g_free(tb->id);
++}
++
++static const QemuOptDesc tpm_xenstubdoms_cmdline_opts[] = {
++    TPM_STANDARD_CMDLINE_OPTS,
++    {},
++};
++
++static const TPMDriverOps tpm_xenstubdoms_driver = {
++    .type                     = TPM_TYPE_XENSTUBDOMS,
++    .opts                     = tpm_xenstubdoms_cmdline_opts,
++    .desc                     = tpm_xenstubdoms_create_desc,
++    .create                   = tpm_xenstubdoms_create,
++    .destroy                  = tpm_xenstubdoms_destroy,
++    .init                     = tpm_xenstubdoms_init,
++    .startup_tpm              = tpm_xenstubdoms_startup_tpm,
++    .realloc_buffer           = tpm_xenstubdoms_realloc_buffer,
++    .reset                    = tpm_xenstubdoms_reset,
++    .had_startup_error        = tpm_xenstubdoms_get_startup_error,
++    .deliver_request          = tpm_xenstubdoms_deliver_request,
++    .cancel_cmd               = tpm_xenstubdoms_cancel_cmd,
++    .get_tpm_established_flag = tpm_xenstubdoms_get_tpm_established_flag,
++};
++
++static void tpm_xenstubdoms_inst_init(Object *obj)
++{
++}
++
++static void tpm_xenstubdoms_inst_finalize(Object *obj)
++{
++}
++
++static void tpm_xenstubdoms_class_init(ObjectClass *klass, void *data)
++{
++    TPMBackendClass *tbc = TPM_BACKEND_CLASS(klass);
++    tbc->ops = &tpm_xenstubdoms_driver;
++}
++
++static const TypeInfo tpm_xenstubdoms_info = {
++    .name = TYPE_TPM_XENSTUBDOMS,
++    .parent = TYPE_TPM_BACKEND,
++    .instance_size = sizeof(TPMXenstubdomsState),
++    .class_init = tpm_xenstubdoms_class_init,
++    .instance_init = tpm_xenstubdoms_inst_init,
++    .instance_finalize = tpm_xenstubdoms_inst_finalize,
++};
++
++static void tpm_xenstubdoms_register(void)
++{
++    type_register_static(&tpm_xenstubdoms_info);
++    tpm_register_driver(&tpm_xenstubdoms_driver);
++}
++
++type_init(tpm_xenstubdoms_register)
+diff --git a/hw/tpm/xen_stubdom_vtpm.c b/hw/tpm/xen_stubdom_vtpm.c
+new file mode 100644
+index 0000000..4fd6053
+--- /dev/null
++++ b/hw/tpm/xen_stubdom_vtpm.c
+@@ -0,0 +1,321 @@
++/*
++ * Connect to Xen vTPM stubdom domain
++ *
++ *  Copyright (c) 2014 Intel Corporation
++ *  Authors:
++ *    Quan Xu <quan.xu@intel.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, see <http://www.gnu.org/licenses/>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <string.h>
++#include <unistd.h>
++#include <signal.h>
++#include <inttypes.h>
++#include <time.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <sys/uio.h>
++
++#include "hw/hw.h"
++#include "block/aio.h"
++#include "hw/xen/xen_backend.h"
++
++enum tpmif_state {
++    TPMIF_STATE_IDLE,        /* no contents / vTPM idle / cancel complete */
++    TPMIF_STATE_SUBMIT,      /* request ready / vTPM working */
++    TPMIF_STATE_FINISH,      /* response ready / vTPM idle */
++    TPMIF_STATE_CANCEL,      /* cancel requested / vTPM working */
++};
++
++static AioContext *vtpm_aio_ctx;
++
++enum status_bits {
++    VTPM_STATUS_RUNNING  = 0x1,
++    VTPM_STATUS_IDLE     = 0x2,
++    VTPM_STATUS_RESULT   = 0x4,
++    VTPM_STATUS_CANCELED = 0x8,
++};
++
++struct tpmif_shared_page {
++    uint32_t length;         /* request/response length in bytes */
++
++    uint8_t  state;           /* enum tpmif_state */
++    uint8_t  locality;        /* for the current request */
++    uint8_t  pad;             /* should be zero */
++
++    uint8_t  nr_extra_pages;  /* extra pages for long packets; may be zero */
++    uint32_t extra_pages[0]; /* grant IDs; length is actually nr_extra_pages */
++};
++
++struct XenVtpmDev {
++    struct XenDevice xendev;  /* must be first */
++    struct           tpmif_shared_page *shr;
++    xc_gntshr        *xen_xcs;
++    int              ring_ref;
++    int              bedomid;
++    QEMUBH           *sr_bh;
++};
++
++static uint8_t vtpm_status(struct XenVtpmDev *vtpmdev)
++{
++    switch (vtpmdev->shr->state) {
++    case TPMIF_STATE_IDLE:
++    case TPMIF_STATE_FINISH:
++        return VTPM_STATUS_IDLE;
++    case TPMIF_STATE_SUBMIT:
++    case TPMIF_STATE_CANCEL:
++        return VTPM_STATUS_RUNNING;
++    default:
++        return 0;
++    }
++}
++
++static int xenbus_switch_state(struct XenDevice *xendev, enum xenbus_state xbus)
++{
++    xs_transaction_t xbt = XBT_NULL;
++
++    if (xendev->fe_state == xbus) {
++        return 0;
++    }
++
++    xendev->fe_state = xbus;
++
++retry_transaction:
++    xbt = xs_transaction_start(xenstore);
++    if (xbt == XBT_NULL) {
++        goto abort_transaction;
++    }
++
++    if (xenstore_write_int(xendev->fe, "state", xbus)) {
++        goto abort_transaction;
++    }
++
++    if (!xs_transaction_end(xenstore, xbt, 0)) {
++        if (errno == EAGAIN) {
++            goto retry_transaction;
++        }
++    }
++
++    return 0;
++
++abort_transaction:
++    xs_transaction_end(xenstore, xbt, 1);
++    return -1;
++}
++
++static bool vtpm_aio_wait(AioContext *ctx)
++{
++    return aio_poll(ctx, true);
++}
++
++static void sr_bh_handler(void *opaque)
++{
++}
++
++static int vtpm_recv(struct XenDevice *xendev, uint8_t* buf, size_t *count)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++    struct tpmif_shared_page *shr = vtpmdev->shr;
++    unsigned int offset;
++
++    if (shr->state == TPMIF_STATE_IDLE) {
++        return -ECANCELED;
++    }
++
++    while (vtpm_status(vtpmdev) != VTPM_STATUS_IDLE) {
++        vtpm_aio_wait(vtpm_aio_ctx);
++    }
++
++    offset = sizeof(*shr) + 4*shr->nr_extra_pages;
++    memcpy(buf, offset + (uint8_t *)shr, shr->length);
++    *count = shr->length;
++
++    return 0;
++}
++
++static int vtpm_send(struct XenDevice *xendev, uint8_t* buf, size_t count)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++    struct tpmif_shared_page *shr = vtpmdev->shr;
++    unsigned int offset = sizeof(*shr) + 4*shr->nr_extra_pages;
++
++    while (vtpm_status(vtpmdev) != VTPM_STATUS_IDLE) {
++        vtpm_aio_wait(vtpm_aio_ctx);
++    }
++
++    memcpy(offset + (uint8_t *)shr, buf, count);
++    shr->length = count;
++    barrier();
++    shr->state = TPMIF_STATE_SUBMIT;
++    xen_wmb();
++    xen_be_send_notify(&vtpmdev->xendev);
++
++    while (vtpm_status(vtpmdev) != VTPM_STATUS_IDLE) {
++        vtpm_aio_wait(vtpm_aio_ctx);
++    }
++
++    return count;
++}
++
++static int vtpm_initialise(struct XenDevice *xendev)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++    xs_transaction_t xbt = XBT_NULL;
++    unsigned int ring_ref;
++
++    vtpmdev->xendev.fe = xenstore_read_be_str(&vtpmdev->xendev, "frontend");
++    if (vtpmdev->xendev.fe == NULL) {
++        return -1;
++    }
++
++    /* Get backend domid */
++    if (xenstore_read_fe_int(&vtpmdev->xendev, "backend-id",
++                             &vtpmdev->bedomid)) {
++        return -1;
++    }
++
++    /*alloc share page*/
++    vtpmdev->shr = xc_gntshr_share_pages(vtpmdev->xen_xcs, vtpmdev->bedomid, 1,
++                                         &ring_ref, PROT_READ|PROT_WRITE);
++    vtpmdev->ring_ref = ring_ref;
++    if (vtpmdev->shr == NULL) {
++        return -1;
++    }
++
++    /*Create event channel */
++    if (xen_be_alloc_unbound(&vtpmdev->xendev, 0, vtpmdev->bedomid)) {
++        xc_gntshr_munmap(vtpmdev->xen_xcs, vtpmdev->shr, 1);
++        return -1;
++    }
++
++    xc_evtchn_unmask(vtpmdev->xendev.evtchndev,
++                     vtpmdev->xendev.local_port);
++
++again:
++    xbt = xs_transaction_start(xenstore);
++    if (xbt == XBT_NULL) {
++        goto abort_transaction;
++    }
++
++    if (xenstore_write_int(vtpmdev->xendev.fe, "ring-ref",
++                           vtpmdev->ring_ref)) {
++        goto abort_transaction;
++    }
++
++    if (xenstore_write_int(vtpmdev->xendev.fe, "event-channel",
++                           vtpmdev->xendev.local_port)) {
++        goto abort_transaction;
++    }
++
++    /* Publish protocol v2 feature */
++    if (xenstore_write_int(vtpmdev->xendev.fe, "feature-protocol-v2", 1)) {
++        goto abort_transaction;
++    }
++
++    if (!xs_transaction_end(xenstore, xbt, 0)) {
++        if (errno == EAGAIN) {
++            goto again;
++        }
++    }
++    /* Tell vtpm backend that we are ready */
++    xenbus_switch_state(&vtpmdev->xendev, XenbusStateInitialised);
++
++    return 0;
++
++abort_transaction:
++    xc_gntshr_munmap(vtpmdev->xen_xcs, vtpmdev->shr, 1);
++    xs_transaction_end(xenstore, xbt, 1);
++    return -1;
++}
++
++static void vtpm_backend_changed(struct XenDevice *xendev, const char *node)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++    int be_state;
++
++    if (strcmp(node, "state") == 0) {
++        xenstore_read_be_int(&vtpmdev->xendev, node, &be_state);
++        switch (be_state) {
++        case XenbusStateConnected:
++            /*TODO*/
++            break;
++        case XenbusStateClosing:
++        case XenbusStateClosed:
++            xenbus_switch_state(&vtpmdev->xendev, XenbusStateClosing);
++            break;
++        default:
++            break;
++        }
++    }
++}
++
++static int vtpm_free(struct XenDevice *xendev)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++    aio_poll(vtpm_aio_ctx, false);
++    qemu_bh_delete(vtpmdev->sr_bh);
++    if (vtpmdev->shr) {
++        xc_gntshr_munmap(vtpmdev->xen_xcs, vtpmdev->shr, 1);
++    }
++    xc_interface_close(vtpmdev->xen_xcs);
++    return 0;
++}
++
++static void vtpm_alloc(struct XenDevice *xendev)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++
++    vtpm_aio_ctx = aio_context_new(NULL);
++    if (vtpm_aio_ctx == NULL) {
++        return;
++    }
++    vtpmdev->sr_bh = aio_bh_new(vtpm_aio_ctx, sr_bh_handler, vtpmdev);
++    qemu_bh_schedule(vtpmdev->sr_bh);
++    vtpmdev->xen_xcs = xen_xc_gntshr_open(0, 0);
++}
++
++static void vtpm_event(struct XenDevice *xendev)
++{
++    struct XenVtpmDev *vtpmdev = container_of(xendev, struct XenVtpmDev,
++                                              xendev);
++
++    qemu_bh_schedule(vtpmdev->sr_bh);
++}
++
++struct XenDevOps xen_vtpmdev_ops = {
++    .size             = sizeof(struct XenVtpmDev),
++    .flags            = DEVOPS_FLAG_IGNORE_STATE |
++                        DEVOPS_FLAG_STUBDOM_BE,
++    .event            = vtpm_event,
++    .free             = vtpm_free,
++    .alloc            = vtpm_alloc,
++    .initialise       = vtpm_initialise,
++    .backend_changed  = vtpm_backend_changed,
++    .recv             = vtpm_recv,
++    .send             = vtpm_send,
++};
+diff --git a/hw/xen/xen_backend.c b/hw/xen/xen_backend.c
+index b2cb22b..8fb3d57 100644
+--- a/hw/xen/xen_backend.c
++++ b/hw/xen/xen_backend.c
+@@ -194,6 +194,32 @@ int xen_be_set_state(struct XenDevice *xendev, enum xenbus_state state)
+     return 0;
+ }
+ 
++/*get stubdom backend*/
++static char *xen_stubdom_be(const char *type, int dom, int dev)
++{
++    char *val, *domu;
++    char path[XEN_BUFSIZE];
++    unsigned int len, ival;
++
++    /*front domu*/
++    domu = xs_get_domain_path(xenstore, dom);
++    snprintf(path, sizeof(path), "%s/device/%s/%d/backend-id",
++             domu, type, dev);
++    g_free(domu);
++
++    val = xs_read(xenstore, 0, path, &len);
++    if (!val || 1 != sscanf(val, "%d", &ival)) {
++        g_free(val);
++        return NULL;
++    }
++    g_free(val);
++
++    /*backend domu*/
++    domu = xs_get_domain_path(xenstore, ival);
++
++    return domu;
++}
++
+ /* ------------------------------------------------------------- */
+ 
+ struct XenDevice *xen_be_find_xendev(const char *type, int dom, int dev)
+@@ -273,6 +299,68 @@ static struct XenDevice *xen_be_get_xendev(const char *type, int dom, int dev,
+ }
+ 
+ /*
++ * get xen stubdom backend device, allocate a new one if it doesn't exist.
++ */
++static struct XenDevice *xen_stubdom_be_get_xendev(const char *type,
++                         int dom, int dev, struct XenDevOps *ops)
++{
++    struct XenDevice *xendev;
++    char *stub;
++
++    xendev = xen_be_find_xendev(type, dom, dev);
++    if (xendev) {
++        return xendev;
++    }
++
++    /* init new xendev */
++    xendev = g_malloc0(ops->size);
++    xendev->type  = type;
++    xendev->dom   = dom;
++    xendev->dev   = dev;
++    xendev->ops   = ops;
++
++    if (ops->flags & DEVOPS_FLAG_STUBDOM_BE) {
++        stub = xen_stubdom_be(xendev->type, xendev->dom, xendev->dev);
++        snprintf(xendev->be, sizeof(xendev->be), "%s/backend/%s/%d/%d",
++                 stub, xendev->type, xendev->dom, xendev->dev);
++        g_free(stub);
++    }
++    snprintf(xendev->name, sizeof(xendev->name), "%s-%d",
++             xendev->type, xendev->dev);
++
++    xendev->debug      = debug;
++    xendev->local_port = -1;
++
++    xendev->evtchndev = xen_xc_evtchn_open(NULL, 0);
++    if (xendev->evtchndev == XC_HANDLER_INITIAL_VALUE) {
++        xen_be_printf(NULL, 0, "can't open evtchn device\n");
++        g_free(xendev);
++        return NULL;
++    }
++    fcntl(xc_evtchn_fd(xendev->evtchndev), F_SETFD, FD_CLOEXEC);
++
++    if (ops->flags & DEVOPS_FLAG_NEED_GNTDEV) {
++        xendev->gnttabdev = xen_xc_gnttab_open(NULL, 0);
++        if (xendev->gnttabdev == XC_HANDLER_INITIAL_VALUE) {
++            xen_be_printf(NULL, 0, "can't open gnttab device\n");
++            xc_evtchn_close(xendev->evtchndev);
++            g_free(xendev);
++            return NULL;
++        }
++    } else {
++        xendev->gnttabdev = XC_HANDLER_INITIAL_VALUE;
++    }
++
++    QTAILQ_INSERT_TAIL(&xendevs, xendev, next);
++
++    if (xendev->ops->alloc) {
++        xendev->ops->alloc(xendev);
++    }
++
++    return xendev;
++}
++
++/*
+  * release xen backend device.
+  */
+ static struct XenDevice *xen_be_del_xendev(int dom, int dev)
+@@ -611,6 +699,47 @@ static int xenstore_scan(const char *type, int dom, struct XenDevOps *ops)
+     return 0;
+ }
+ 
++static void stubdom_update_be(char *watch, char *type, int dom,
++                              struct XenDevOps *ops)
++{
++    struct XenDevice *xendev;
++    char path[XEN_BUFSIZE];
++    char *ptr, *bepath;
++    unsigned int len, dev;
++
++    if (!(ops->flags & DEVOPS_FLAG_STUBDOM_BE)) {
++        return;
++    }
++
++    len = snprintf(path, sizeof(path), "backend/%s/%d", type, dom);
++    ptr = strstr(watch, path);
++    if (ptr == NULL) {
++        return;
++    }
++
++    if (sscanf(ptr+len, "/%u/%255s", &dev, path) != 2) {
++        strcpy(path, "");
++        if (sscanf(ptr+len, "/%u", &dev) != 1) {
++            dev = -1;
++        }
++    }
++
++    if (dev == -1) {
++        return;
++    }
++
++    xendev = xen_be_get_xendev(type, dom, dev, ops);
++    if (xendev != NULL) {
++        bepath = xs_read(xenstore, 0, xendev->be, &len);
++        if (bepath == NULL) {
++            xen_be_del_xendev(dom, dev);
++        } else {
++            free(bepath);
++            xen_be_backend_changed(xendev, path);
++        }
++    }
++}
++
+ static void xenstore_update_be(char *watch, char *type, int dom,
+                                struct XenDevOps *ops)
+ {
+@@ -681,6 +810,10 @@ static void xenstore_update(void *unused)
+     if (sscanf(vec[XS_WATCH_TOKEN], "fe:%" PRIxPTR, &ptr) == 1) {
+         xenstore_update_fe(vec[XS_WATCH_PATH], (void*)ptr);
+     }
++    if (sscanf(vec[XS_WATCH_TOKEN], "stub:%" PRIxPTR ":%d:%" PRIxPTR,
++               &type, &dom, &ops) == 3) {
++        stubdom_update_be(vec[XS_WATCH_PATH], (void *)type, dom, (void *)ops);
++    }
+ 
+ cleanup:
+     free(vec);
+@@ -732,11 +865,114 @@ err:
+     return -1;
+ }
+ 
++static int stubdom_check(struct XenDevice *xendev, uint32_t domid,
++                         int handle)
++{
++    int rc = 0;
++
++    if (xendev->ops->init) {
++        rc = xendev->ops->init(xendev);
++    }
++
++    if(rc != 0) {
++       xen_be_printf(xendev, 0, "xendev %s init error\n",
++                     xendev->name);
++       goto err;
++    }
++
++    if (xendev->ops->initialise) {
++        rc = xendev->ops->initialise(xendev);
++    }
++
++    if(rc != 0) {
++       xen_be_printf(xendev, 0, "xendev %s initialise error\n",
++                     xendev->name);
++       goto err;
++    }
++
++    if (xendev->ops->connected) {
++        xendev->ops->connected(xendev);
++    }
++
++    return rc;
++
++err:
++    xen_be_del_xendev(domid, handle);
++    return -1;
++}
++
++static int xenstore_stubdom_scan(const char *type, uint32_t domid,
++                                 struct XenDevOps *ops)
++{
++    struct XenDevice *xendev;
++    char path[XEN_BUFSIZE], token[XEN_BUFSIZE];
++    char *domu;
++    unsigned int cdev, j;
++    char **dev = NULL;
++
++    /*stubom : /local/domain/ID */
++    domu = xs_get_domain_path(xenstore, domid);
++    snprintf(path, sizeof(path), "%s/device/%s",
++             domu, type);
++    free(domu);
++    dev = xs_directory(xenstore, 0, path, &cdev);
++    if (dev == NULL) {
++        return 0;
++    }
++
++    for (j = 0; j < cdev; j++) {
++        xendev = xen_stubdom_be_get_xendev(type, domid,
++                                           atoi(dev[j]), ops);
++        if (xendev == NULL) {
++            xen_be_printf(xendev, 0, "xendev is NULL.\n");
++            continue;
++        }
++
++        /* simplify QEMU side, a thread is running in Xen stubdom, which will
++         * connect frontend when the frontend is initialised.
++         */
++        if (stubdom_check(xendev, domid, atoi(dev[j])) < 0) {
++            xen_be_printf(xendev, 0, "xendev stubdom_check error.\n");
++            continue;
++        }
++
++        /*setup watch*/
++        snprintf(token, sizeof(token), "stub:%p:%d:%p",
++                 type, domid, xendev->ops);
++        if (!xs_watch(xenstore, xendev->be, token)) {
++            xen_be_printf(xendev, 0, "xs_watch failed.\n");
++            return -1;
++        }
++    }
++
++    free(dev);
++    return 0;
++}
++
++int xen_fe_register(const char *type, struct XenDevOps *ops)
++{
++    return xenstore_stubdom_scan(type, xen_domid, ops);
++}
++
+ int xen_be_register(const char *type, struct XenDevOps *ops)
+ {
+     return xenstore_scan(type, xen_domid, ops);
+ }
+ 
++int xen_be_alloc_unbound(struct XenDevice *xendev, int dom, int remote_dom)
++{
++    xendev->local_port = xc_evtchn_bind_unbound_port(xendev->evtchndev,
++                                                     remote_dom);
++    if (xendev->local_port == -1) {
++        xen_be_printf(xendev, 0, "xc_evtchn_alloc_unbound failed\n");
++        return -1;
++    }
++    xen_be_printf(xendev, 2, "bind evtchn port %d\n", xendev->local_port);
++    qemu_set_fd_handler(xc_evtchn_fd(xendev->evtchndev),
++                        xen_be_evtchn_event, NULL, xendev);
++    return 0;
++}
++
+ int xen_be_bind_evtchn(struct XenDevice *xendev)
+ {
+     if (xendev->local_port != -1) {
+@@ -770,6 +1006,42 @@ int xen_be_send_notify(struct XenDevice *xendev)
+     return xc_evtchn_notify(xendev->evtchndev, xendev->local_port);
+ }
+ 
++int xen_vtpm_send(unsigned char *buf, size_t count)
++{
++    struct XenDevice *xendev;
++    int rc = -1;
++
++    xendev = xen_be_find_xendev("vtpm", xen_domid, 0);
++    if (xendev == NULL) {
++        xen_be_printf(xendev, 0, "Con not find vtpm device\n");
++        return -1;
++    }
++
++    if (xendev->ops->send) {
++        rc = xendev->ops->send(xendev, buf, count);
++    }
++
++    return rc;
++}
++
++int xen_vtpm_recv(unsigned char *buf, size_t *count)
++{
++    struct XenDevice *xendev;
++    int rc = -1;
++
++    xendev = xen_be_find_xendev("vtpm", xen_domid, 0);
++    if (xendev == NULL) {
++        xen_be_printf(xendev, 0, "Con not find vtpm device\n");
++        return -1;
++    }
++
++    if (xendev->ops->recv) {
++        xendev->ops->recv(xendev, buf, count);
++    }
++
++    return rc;
++}
++
+ /*
+  * msg_level:
+  *  0 == errors (stderr + logfile).
+diff --git a/include/hw/xen/xen_backend.h b/include/hw/xen/xen_backend.h
+index 3b4125e..f2d5489 100644
+--- a/include/hw/xen/xen_backend.h
++++ b/include/hw/xen/xen_backend.h
+@@ -15,6 +15,8 @@ struct XenDevice;
+ #define DEVOPS_FLAG_NEED_GNTDEV   1
+ /* don't expect frontend doing correct state transitions (aka console quirk) */
+ #define DEVOPS_FLAG_IGNORE_STATE  2
++/*dev backend is stubdom*/
++#define DEVOPS_FLAG_STUBDOM_BE    4
+ 
+ struct XenDevOps {
+     size_t    size;
+@@ -26,6 +28,8 @@ struct XenDevOps {
+     void      (*event)(struct XenDevice *xendev);
+     void      (*disconnect)(struct XenDevice *xendev);
+     int       (*free)(struct XenDevice *xendev);
++    int       (*send)(struct XenDevice *xendev, uint8_t* buf, size_t count);
++    int       (*recv)(struct XenDevice *xendev, uint8_t* buf, size_t *count);
+     void      (*backend_changed)(struct XenDevice *xendev, const char *node);
+     void      (*frontend_changed)(struct XenDevice *xendev, const char *node);
+ };
+@@ -91,12 +95,19 @@ int xen_be_send_notify(struct XenDevice *xendev);
+ void xen_be_printf(struct XenDevice *xendev, int msg_level, const char *fmt, ...)
+     GCC_FMT_ATTR(3, 4);
+ 
++/*Xen stubdom vtpm*/
++int xen_fe_register(const char *type, struct XenDevOps *ops);
++int xen_be_alloc_unbound(struct XenDevice *xendev, int dom, int remote_dom);
++int xen_vtpm_send(unsigned char *buf, size_t count);
++int xen_vtpm_recv(unsigned char *buf, size_t *count);
++
+ /* actual backend drivers */
+ extern struct XenDevOps xen_console_ops;      /* xen_console.c     */
+ extern struct XenDevOps xen_kbdmouse_ops;     /* xen_framebuffer.c */
+ extern struct XenDevOps xen_framebuffer_ops;  /* xen_framebuffer.c */
+ extern struct XenDevOps xen_blkdev_ops;       /* xen_disk.c        */
+ extern struct XenDevOps xen_netdev_ops;       /* xen_nic.c         */
++extern struct XenDevOps xen_vtpmdev_ops;      /* xen_stubdom_vtpm.c*/
+ 
+ void xen_init_display(int domid);
+ 
+diff --git a/include/hw/xen/xen_common.h b/include/hw/xen/xen_common.h
+index 95612a4..fb43084 100644
+--- a/include/hw/xen/xen_common.h
++++ b/include/hw/xen/xen_common.h
+@@ -130,6 +130,12 @@ static inline XenXC xen_xc_interface_open(void *logger, void *dombuild_logger,
+     return xc_interface_open(logger, dombuild_logger, open_flags);
+ }
+ 
++static inline xc_gntshr *xen_xc_gntshr_open(void *logger,
++                                           unsigned int open_flags)
++{
++    return xc_gntshr_open(logger, open_flags);
++}
++
+ /* FIXME There is now way to have the xen fd */
+ static inline int xc_fd(xc_interface *xen_xc)
+ {
+diff --git a/qapi-schema.json b/qapi-schema.json
+index 24379ab..17e9d0f 100644
+--- a/qapi-schema.json
++++ b/qapi-schema.json
+@@ -2855,8 +2855,12 @@
+ # @passthrough: TPM passthrough type
+ #
+ # Since: 1.5
++#
++# @xenstubdoms: TPM xenstubdoms type
++#
++# Since: 2.3
+ ##
+-{ 'enum': 'TpmType', 'data': [ 'passthrough' ] }
++{ 'enum': 'TpmType', 'data': [ 'passthrough', 'xenstubdoms' ] }
+ 
+ ##
+ # @query-tpm-types:
+@@ -2884,6 +2888,16 @@
+ { 'type': 'TPMPassthroughOptions', 'data': { '*path' : 'str',
+                                              '*cancel-path' : 'str'} }
+ 
++# @TPMXenstubdomsOptions:
++#
++# Information about the TPM xenstubdoms type
++#
++# Since: 2.3
++##
++{ 'type': 'TPMXenstubdomsOptions', 'data': {  } }
++#
++##
++
+ ##
+ # @TpmTypeOptions:
+ #
+@@ -2894,7 +2908,9 @@
+ # Since: 1.5
+ ##
+ { 'union': 'TpmTypeOptions',
+-   'data': { 'passthrough' : 'TPMPassthroughOptions' } }
++  'data': { 'passthrough' : 'TPMPassthroughOptions',
++            'xenstubdoms' : 'TPMXenstubdomsOptions' } }
++##
+ 
+ ##
+ # @TpmInfo:
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 1e7d5b8..fd73f57 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -2485,7 +2485,8 @@ DEF("tpmdev", HAS_ARG, QEMU_OPTION_tpmdev, \
+     "-tpmdev passthrough,id=id[,path=path][,cancel-path=path]\n"
+     "                use path to provide path to a character device; default is /dev/tpm0\n"
+     "                use cancel-path to provide path to TPM's cancel sysfs entry; if\n"
+-    "                not provided it will be searched for in /sys/class/misc/tpm?/device\n",
++    "                not provided it will be searched for in /sys/class/misc/tpm?/device\n"
++    "-tpmdev xenstubdoms,id=id\n",
+     QEMU_ARCH_ALL)
+ STEXI
+ 
+@@ -2495,7 +2496,8 @@ The general form of a TPM device option is:
+ @item -tpmdev @var{backend} ,id=@var{id} [,@var{options}]
+ @findex -tpmdev
+ Backend type must be:
+-@option{passthrough}.
++@option{passthrough}, or
++@option{xenstubdoms}.
+ 
+ The specific backend type will determine the applicable options.
+ The @code{-tpmdev} option creates the TPM backend and requires a
+@@ -2545,6 +2547,13 @@ To create a passthrough TPM use the following two options:
+ Note that the @code{-tpmdev} id is @code{tpm0} and is referenced by
+ @code{tpmdev=tpm0} in the device option.
+ 
++To create a xenstubdoms TPM use the following two options:
++@example
++-tpmdev xenstubdoms,id=tpm0 -device tpm-tis,tpmdev=tpm0
++@end example
++Note that the @code{-tpmdev} id is @code{tpm0} and is referenced by
++@code{tpmdev=tpm0} in the device option.
++
+ @end table
+ 
+ ETEXI
+diff --git a/tpm.c b/tpm.c
+index c371023..ee9acb8 100644
+--- a/tpm.c
++++ b/tpm.c
+@@ -25,7 +25,7 @@ static QLIST_HEAD(, TPMBackend) tpm_backends =
+ 
+ 
+ #define TPM_MAX_MODELS      1
+-#define TPM_MAX_DRIVERS     1
++#define TPM_MAX_DRIVERS     2
+ 
+ static TPMDriverOps const *be_drivers[TPM_MAX_DRIVERS] = {
+     NULL,
+@@ -256,6 +256,7 @@ static TPMInfo *qmp_query_tpm_inst(TPMBackend *drv)
+ {
+     TPMInfo *res = g_new0(TPMInfo, 1);
+     TPMPassthroughOptions *tpo;
++    TPMXenstubdomsOptions *txo;
+ 
+     res->id = g_strdup(drv->id);
+     res->model = drv->fe_model;
+@@ -275,6 +276,10 @@ static TPMInfo *qmp_query_tpm_inst(TPMBackend *drv)
+             tpo->has_cancel_path = true;
+         }
+         break;
++    case TPM_TYPE_XENSTUBDOMS:
++        res->options->kind = TPM_TYPE_OPTIONS_KIND_XENSTUBDOMS;
++        txo = g_new0(TPMXenstubdomsOptions, 1);
++        res->options->xenstubdoms = txo;
+     case TPM_TYPE_MAX:
+         break;
+     }
+diff --git a/vl.c b/vl.c
+index f6b3546..dd437e1 100644
+--- a/vl.c
++++ b/vl.c
+@@ -4114,12 +4114,6 @@ int main(int argc, char **argv, char **envp)
+         exit(1);
+     }
+ 
+-#ifdef CONFIG_TPM
+-    if (tpm_init() < 0) {
+-        exit(1);
+-    }
+-#endif
+-
+     /* init the bluetooth world */
+     if (foreach_device_config(DEV_BT, bt_parse))
+         exit(1);
+@@ -4225,6 +4219,16 @@ int main(int argc, char **argv, char **envp)
+             exit(1);
+     }
+ 
++    /* For compatible with Xen stubdom vTPM driver, make
++     * sure QEMU machine class is initialized and QEMU has
++     * registered Xen stubdom vTPM driver ..
++    */
++#ifdef CONFIG_TPM
++    if (tpm_init() < 0) {
++        exit(1);
++    }
++#endif
++
+     /* init generic devices */
+     if (qemu_opts_foreach(qemu_find_opts("device"), device_init_func, NULL, 1) != 0)
+         exit(1);
+diff --git a/xen-hvm.c b/xen-hvm.c
+index 21f1cbb..854b8f7 100644
+--- a/xen-hvm.c
++++ b/xen-hvm.c
+@@ -1067,6 +1067,11 @@ int xen_hvm_init(ram_addr_t *below_4g_mem_size, ram_addr_t *above_4g_mem_size,
+     int i, rc;
+     unsigned long ioreq_pfn;
+     unsigned long bufioreq_evtchn;
++
++#ifdef CONFIG_TPM_XENSTUBDOMS
++    unsigned long stubdom_vtpm = 0;
++#endif
++
+     XenIOState *state;
+ 
+     state = g_malloc0(sizeof (XenIOState));
+@@ -1169,6 +1174,14 @@ int xen_hvm_init(ram_addr_t *below_4g_mem_size, ram_addr_t *above_4g_mem_size,
+         fprintf(stderr, "%s: xen backend core setup failed\n", __FUNCTION__);
+         return -1;
+     }
++
++#ifdef CONFIG_TPM_XENSTUBDOMS
++    xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_STUBDOM_VTPM, &stubdom_vtpm);
++    if (stubdom_vtpm) {
++        xen_fe_register("vtpm", &xen_vtpmdev_ops);
++    }
++#endif
++
+     xen_be_register("console", &xen_console_ops);
+     xen_be_register("vkbd", &xen_kbdmouse_ops);
+     xen_be_register("qdisk", &xen_blkdev_ops);
